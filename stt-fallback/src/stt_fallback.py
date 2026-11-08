@@ -20,12 +20,9 @@ _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_LANGUAGE = "en"
 
-# Limits for a single STT race. Kept below the satellite's recovery watchdog.
-# Keep STT inside the 15-second user-facing budget: leave ~3s for
-# Home Assistant intent handling, TTS setup, and transport.
-MAX_RECORDING_SECONDS = 12.0  # No Wyoming AudioStop: fail closed.
-RESULT_TIMEOUT_SECONDS = 9.0  # Maximum wait *after* AudioStop.
-MAX_STT_SECONDS = 12.0  # Absolute limit since this STT request started.
+# Absolute STT budget, starting when the Wyoming request begins.
+# Configurable via the Home Assistant add-on's stt_timeout_seconds option.
+DEFAULT_STT_TIMEOUT_SECONDS = 8.0
 MAX_AUDIO_BYTES = 2_000_000
 MAX_QUEUED_CHUNKS = 512
 CLEANUP_TIMEOUT_SECONDS = 2.0
@@ -121,6 +118,10 @@ async def main() -> None:
     parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to console"
     )
+    parser.add_argument(
+        "--stt-timeout-seconds", type=float, default=DEFAULT_STT_TIMEOUT_SECONDS,
+        help="Absolute timeout for a single STT request in seconds",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     # Do not log args: they contain the Home Assistant access token.
@@ -171,7 +172,10 @@ async def main() -> None:
 
     try:
         await server.run(
-            partial(FallbackEventHandler, entities, args.hass_token, args.hass_http_uri)
+            partial(
+                FallbackEventHandler, entities, args.hass_token, args.hass_http_uri,
+                args.stt_timeout_seconds,
+            )
         )
     except KeyboardInterrupt:
         pass
@@ -186,6 +190,7 @@ class FallbackEventHandler(AsyncEventHandler):
         entities: List[STTEntity],
         hass_token: str,
         hass_http_uri: str,
+        stt_timeout_seconds: float = DEFAULT_STT_TIMEOUT_SECONDS,
         *args,
         **kwargs,
     ) -> None:
@@ -193,6 +198,7 @@ class FallbackEventHandler(AsyncEventHandler):
         self.entities = entities
         self.hass_token = hass_token
         self.hass_http_uri = hass_http_uri
+        self.stt_timeout_seconds = stt_timeout_seconds
         self.client_id = str(time.monotonic_ns())
         self._language = DEFAULT_LANGUAGE
         self._request: Optional[RaceRequest] = None
@@ -200,7 +206,7 @@ class FallbackEventHandler(AsyncEventHandler):
         self._info_event: Optional[Event] = None
 
     async def handle_event(self, event: Event) -> bool:
-        """Handle Wyoming events. AudioStop waits *at most* RESULT_TIMEOUT_SECONDS."""
+        """Handle Wyoming events with an absolute STT deadline."""
         try:
             if Describe.is_type(event.type):
                 await self._write_info()
@@ -262,10 +268,10 @@ class FallbackEventHandler(AsyncEventHandler):
                 if req.watchdog is not None:
                     req.watchdog.cancel()
                 _LOGGER.info(
-                    "[%s] AudioStop received: %d bytes, waiting up to %.1fs",
+                    "[%s] AudioStop received: %d bytes, %.1fs STT budget remaining",
                     req.request_id,
                     req.audio_bytes,
-                    RESULT_TIMEOUT_SECONDS,
+                    max(0.0, req.started + self.stt_timeout_seconds - time.monotonic()),
                 )
                 for entity_id, queue in req.queues.items():
                     if req.tasks[entity_id].done():
@@ -389,12 +395,8 @@ class FallbackEventHandler(AsyncEventHandler):
     async def _first_success(self, req: RaceRequest) -> str:
         """Wait for first nonempty result; never let a provider hang block us."""
         remaining = len(req.tasks)
-        # The post-AudioStop timeout must never extend the absolute deadline.
-        # This also bounds a provider that consumes audio but never completes.
-        deadline = min(
-            req.started + MAX_STT_SECONDS,
-            asyncio.get_running_loop().time() + RESULT_TIMEOUT_SECONDS,
-        )
+        # AudioStop must not restart the STT deadline.
+        deadline = req.started + self.stt_timeout_seconds
         while remaining:
             seconds_left = deadline - asyncio.get_running_loop().time()
             if seconds_left <= 0:
@@ -427,12 +429,12 @@ class FallbackEventHandler(AsyncEventHandler):
 
     async def _recording_watchdog(self, req: RaceRequest) -> None:
         try:
-            await asyncio.sleep(MAX_RECORDING_SECONDS)
+            await asyncio.sleep(self.stt_timeout_seconds)
             if self._request is req and not req.audio_stopped:
                 _LOGGER.warning(
-                    "[%s] No AudioStop after %.0fs: ending failed request",
+                    "[%s] No AudioStop after %.1fs: ending failed request",
                     req.request_id,
-                    MAX_RECORDING_SECONDS,
+                    self.stt_timeout_seconds,
                 )
                 self._ignore_audio_until_stop = True
                 await self._finish_request(req, "")

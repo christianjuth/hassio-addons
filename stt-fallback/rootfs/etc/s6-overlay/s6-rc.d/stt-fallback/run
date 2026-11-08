@@ -10,7 +10,7 @@ flags=()
 if bashio::config.true 'debug_logging'; then
     flags+=('--debug')
 fi
-
+flags+=('--stt-timeout-seconds' "$(bashio::config 'stt_timeout_seconds')")
 exec python3 stt_fallback.py \
     --uri 'tcp://0.0.0.0:10300' \
     --hass-token "${SUPERVISOR_TOKEN}" \

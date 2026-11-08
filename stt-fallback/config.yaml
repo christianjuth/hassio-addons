@@ -1,5 +1,5 @@
 ---
-version: 1.0.1
+version: 1.0.2
 slug: stt-fallback
 name: stt-fallback
 description: Speech-to-text fallback
@@ -14,9 +14,11 @@ homeassistant_api: true
 options:
   entity_ids: "stt.home_assistant_cloud"
   debug_logging: false
+  stt_timeout_seconds: 8
 schema:
   entity_ids: str
   debug_logging: bool
+  stt_timeout_seconds: int(3,30)
 ports:
   "10300/tcp": null
 homeassistant: 2023.11.0
