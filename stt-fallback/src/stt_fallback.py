@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
-"""Parallel STT race for the Rhasspy stt-fallback Home Assistant add-on.
-
-Derived from https://github.com/rhasspy/hassio-addons/tree/master/stt-fallback
-Copyright (c) 2020 Michael Hansen and contributors. MIT License (see upstream LICENSE).
-
-Every supported STT entity receives the same live audio via its own queue.
-After Wyoming AudioStop, the first nonempty result wins. Both the recording
-and the result wait are bounded, so a hung backend cannot block indefinitely.
-"""
 
 import argparse
 import asyncio
 import logging
-import re
 import time
+import re
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Dict, List, Optional, Set, Tuple, Union
-
+from typing import List, Optional, Set, Dict, Union, Tuple
 import aiohttp
 from wyoming.asr import Transcript, Transcribe
 from wyoming.audio import AudioChunk, AudioStop
+from wyoming.client import AsyncClient
 from wyoming.event import Event
 from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 from wyoming.server import AsyncEventHandler, AsyncServer
@@ -29,12 +20,11 @@ _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_LANGUAGE = "en"
 
-# Defaults are intentionally shorter than the satellite's 45-second watchdog.
-# Change these here if you have unusually long PTT recordings or slow STT.
-MAX_RECORDING_SECONDS = 30.0      # From Transcribe/first chunk to AudioStop
-RESULT_TIMEOUT_SECONDS = 12.0     # Wait after AudioStop for a nonempty result
-MAX_AUDIO_BYTES = 2_000_000       # Upper bound per request (~62 s at 16 kHz mono)
-MAX_QUEUED_CHUNKS = 512           # Per-provider backpressure protection
+# Limits for a single STT race. Kept below the satellite's recovery watchdog.
+MAX_RECORDING_SECONDS = 30.0
+RESULT_TIMEOUT_SECONDS = 12.0
+MAX_AUDIO_BYTES = 2_000_000
+MAX_QUEUED_CHUNKS = 512
 CLEANUP_TIMEOUT_SECONDS = 2.0
 
 
@@ -49,6 +39,7 @@ class STTEntity:
 
     def get_best_language(self, language: str) -> Optional[str]:
         language = language.strip()
+
         if language in self.supported_languages:
             return language
 
@@ -56,24 +47,39 @@ class STTEntity:
         if best_language is not None:
             return best_language
         if not self._supported_lang_map:
+            # {(family, region): language}
             for supported_lang in self.supported_languages:
-                parts = re.split(r"[-_]", supported_lang)
-                family = parts[0].lower()
-                region = parts[1].upper() if len(parts) > 1 else None
-                self._supported_lang_map[(family, region)] = supported_lang
+                supported_lang_parts = re.split(r"[-_]", supported_lang)
+                supported_lang_family = supported_lang_parts[0].lower()
+                supported_lang_region = (
+                    supported_lang_parts[1].upper()
+                    if len(supported_lang_parts) > 1
+                    else None
+                )
+                self._supported_lang_map[
+                    (supported_lang_family, supported_lang_region)
+                ] = supported_lang
 
-        parts = re.split(r"[-_]", language)
-        family = parts[0].lower()
-        region = parts[1].upper() if len(parts) > 1 else None
-        best_language = self._supported_lang_map.get((family, region))
-        if best_language is None and family == "en" and region is None:
-            best_language = self._supported_lang_map.get(("en", "US"))
+        language_parts = re.split(r"[-_]", language)
+        lang_family = language_parts[0].lower()
+        lang_region = language_parts[1].upper() if len(language_parts) > 1 else None
+
+        # Exact match
+        best_language = self._supported_lang_map.get((lang_family, lang_region))
         if best_language is None:
-            best_language = self._supported_lang_map.get((family, None))
+            # Special cases
+            if (lang_family == "en") and (lang_region is None):
+                best_language = self._supported_lang_map.get(("en", "US"))
+
+        if best_language is None:
+            # Family only
+            best_language = self._supported_lang_map.get((lang_family, None))
+
         if best_language is not None:
             self._language_map[language] = best_language
-        return best_language
+            return best_language
 
+        return None
 
 @dataclass
 class RaceRequest:
@@ -93,7 +99,7 @@ class RaceRequest:
 
 
 async def main() -> None:
-    """Run a Wyoming STT server backed by parallel Home Assistant STT entities."""
+    """Runs fallback ASR server."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--uri", required=True, help="unix:// or tcp://")
     parser.add_argument(
@@ -107,60 +113,66 @@ async def main() -> None:
     parser.add_argument(
         "stt_entity_id",
         nargs="+",
-        help="STT entities to run concurrently; first nonempty transcript wins",
+        help="Ids of speech-to-text entities in fallback order",
     )
     parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to console"
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
-    # Do not print args: it includes the Home Assistant access token.
+    # Do not log args: they contain the Home Assistant access token.
 
+    # Get STT entity info
     entities: List[STTEntity] = []
     headers = {"Authorization": f"Bearer {args.hass_token}"}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+    async with aiohttp.ClientSession() as session:
         for entity_id in args.stt_entity_id:
             _LOGGER.debug("Getting info for STT entity: %s", entity_id)
-            try:
-                async with session.get(
-                    f"{args.hass_http_uri}/stt/{entity_id}", headers=headers
-                ) as resp:
-                    if resp.status != 200:
-                        _LOGGER.warning(
-                            "Failed to get entity info for %s: HTTP %s",
-                            entity_id,
-                            resp.status,
-                        )
-                        continue
-                    info = await resp.json()
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                _LOGGER.exception("Failed to get STT entity info: %s", entity_id)
-                continue
+            async with session.get(
+                f"{args.hass_http_uri}/stt/{entity_id}", headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    _LOGGER.warning(
+                        "Failed to get entity info: %s, status=%s",
+                        entity_id,
+                        resp.status,
+                    )
+                    continue
 
-            if (
-                (16000 not in info["sample_rates"])
-                or (16 not in info["bit_rates"])
-                or (1 not in info["channels"])
-                or ("wav" not in info["formats"])
-                or ("pcm" not in info["codecs"])
-            ):
-                _LOGGER.warning(
-                    "Skipping %s: 16 kHz 16-bit mono PCM WAV not supported",
-                    entity_id,
+                info = await resp.json()
+                # Check required audio format
+                if (
+                    (16000 not in info["sample_rates"])
+                    or (16 not in info["bit_rates"])
+                    or (1 not in info["channels"])
+                    or ("wav" not in info["formats"])
+                    or ("pcm" not in info["codecs"])
+                ):
+                    _LOGGER.warning(
+                        "Skipping '%s': 16Khz 16-bit mono PCM is not supported",
+                        entity_id,
+                    )
+                    _LOGGER.warning("%s: %s", entity_id, info)
+                    continue
+                entities.append(
+                    STTEntity(
+                        entity_id=entity_id,
+                        supported_languages=set(info["languages"]),
+                    )
                 )
-                continue
-            entities.append(
-                STTEntity(entity_id=entity_id, supported_languages=set(info["languages"]))
-            )
 
-    _LOGGER.info("Parallel STT ready with entities: %s", [e.entity_id for e in entities])
+    _LOGGER.debug("Entities: %s", entities)
+
     server = AsyncServer.from_uri(args.uri)
+    _LOGGER.info("Ready")
+
     try:
         await server.run(
             partial(FallbackEventHandler, entities, args.hass_token, args.hass_http_uri)
         )
     except KeyboardInterrupt:
         pass
+# -----------------------------------------------------------------------------
 
 
 class FallbackEventHandler(AsyncEventHandler):
@@ -470,16 +482,14 @@ class FallbackEventHandler(AsyncEventHandler):
         info = Info(
             asr=[
                 AsrProgram(
-                    # Keep the upstream program name: Docker HEALTHCHECK
-                    # expects the string "stt-fallback" in Describe output.
                     name="stt-fallback",
                     attribution=Attribution(
                         name="The Home Assistant Authors",
                         url="http://github.com/OHF-voice",
                     ),
-                    description="Parallel Home Assistant STT, first transcript wins",
+                    description="Automatic fallback for Home Assistant speech-to-text",
                     installed=True,
-                    version="1.0.0-parallel.1",
+                    version="1.0.0",
                     models=[
                         AsrModel(
                             name="fallback",
@@ -488,7 +498,7 @@ class FallbackEventHandler(AsyncEventHandler):
                                 url="http://github.com/OHF-voice",
                             ),
                             installed=True,
-                            description="Parallel STT model",
+                            description="Fallback model",
                             version=None,
                             languages=list(sorted(supported_langs)),
                         )
@@ -498,7 +508,7 @@ class FallbackEventHandler(AsyncEventHandler):
         )
         self._info_event = info.event()
         await self.write_event(self._info_event)
-
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     asyncio.run(main())
