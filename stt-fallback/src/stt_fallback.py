@@ -21,8 +21,11 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_LANGUAGE = "en"
 
 # Limits for a single STT race. Kept below the satellite's recovery watchdog.
-MAX_RECORDING_SECONDS = 30.0
-RESULT_TIMEOUT_SECONDS = 12.0
+# Keep STT inside the 15-second user-facing budget: leave ~3s for
+# Home Assistant intent handling, TTS setup, and transport.
+MAX_RECORDING_SECONDS = 12.0  # No Wyoming AudioStop: fail closed.
+RESULT_TIMEOUT_SECONDS = 9.0  # Maximum wait *after* AudioStop.
+MAX_STT_SECONDS = 12.0  # Absolute limit since this STT request started.
 MAX_AUDIO_BYTES = 2_000_000
 MAX_QUEUED_CHUNKS = 512
 CLEANUP_TIMEOUT_SECONDS = 2.0
@@ -386,7 +389,12 @@ class FallbackEventHandler(AsyncEventHandler):
     async def _first_success(self, req: RaceRequest) -> str:
         """Wait for first nonempty result; never let a provider hang block us."""
         remaining = len(req.tasks)
-        deadline = asyncio.get_running_loop().time() + RESULT_TIMEOUT_SECONDS
+        # The post-AudioStop timeout must never extend the absolute deadline.
+        # This also bounds a provider that consumes audio but never completes.
+        deadline = min(
+            req.started + MAX_STT_SECONDS,
+            asyncio.get_running_loop().time() + RESULT_TIMEOUT_SECONDS,
+        )
         while remaining:
             seconds_left = deadline - asyncio.get_running_loop().time()
             if seconds_left <= 0:
